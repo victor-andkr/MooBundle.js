@@ -200,11 +200,18 @@ class FakeWebsocket {
 
     this.setupEventHooks();
 
-    if (url.includes("token=alt")) {
-      this.useTurnstile(url);
-    } else {
-      this.openRealSocket(url, true);
-    }
+    // BUG #7: Use IIFE async for async initialization in constructor
+    (async () => {
+      try {
+        if (url.includes("token=alt")) {
+          await this.useTurnstile(url);
+        } else {
+          this.openRealSocket(url, true);
+        }
+      } catch (e) {
+        console.error("MooVisuals: Failed to initialize socket:", e);
+      }
+    })();
   }
 
   async useTurnstile(oldUrl) {
@@ -231,7 +238,26 @@ class FakeWebsocket {
 
     const wsAddress = oldUrl.split("?token=")[0];
     const newURL = `${wsAddress}?token=cf:${encodeURIComponent(token)}`;
+
+    // BUG #6: Wait for socket to be ready after opening
     this.openRealSocket(newURL, false, elem);
+
+    // Wait for socket to be OPEN
+    await new Promise((resolve, reject) => {
+      const checkSocket = setInterval(() => {
+        if (this.realSocket?.readyState === OriginalWebSocket.OPEN) {
+          clearInterval(checkSocket);
+          resolve();
+        } else if (this.realSocket?.readyState === OriginalWebSocket.CLOSED) {
+          clearInterval(checkSocket);
+          reject(new Error("Socket closed during Turnstile"));
+        }
+      }, 50);
+      setTimeout(() => {
+        clearInterval(checkSocket);
+        reject(new Error("Turnstile socket timeout"));
+      }, 5000);  // 5 second timeout
+    });
   }
 
   setupEventHooks() {
@@ -407,12 +433,17 @@ class FakeWebsocket {
         return;
       }
 
+      // BUG #5: Check protocol initialization
+      if (!this.key || !this.tables) {
+        console.warn("MooVisuals: Protocol not initialized yet, queuing packet");
+        this.packetQueue.push(raw);
+        return;
+      }
+
       // Try to decode with PACKET_PADDING (old format)
       let parsed;
-      let wasAlreadyEncrypted = false;
       try {
         parsed = msgpack.decode(raw.slice(PACKET_PADDING));
-        wasAlreadyEncrypted = true;
       } catch (e) {
         // Try without padding (new 2026 format)
         try {
@@ -435,12 +466,8 @@ class FakeWebsocket {
         return;
       }
 
-      // Update sequence number
-      if (parsed.length < 3) {
-        parsed[2] = this.sequence;
-      } else {
-        parsed[2] = this.sequence;
-      }
+      // BUG #3: Simplified sequence update (no duplicate logic)
+      parsed[2] = this.sequence;
 
       // BUG #2: Re-encrypt with PACKET_PADDING + signature
       const packetData = msgpack.encode(parsed);
