@@ -313,15 +313,13 @@ class FakeWebsocket {
         }
         this.hasInit = true;
 
+        // BUG #4: Process packet queue without await (fire and forget)
         if (this.packetQueue.length) {
-          // BUG #4: Use async/await for packet queue instead of forEach
-          for (const packet of this.packetQueue) {
-            try {
-              await this.send(packet);
-            } catch (e) {
+          this.packetQueue.forEach(packet => {
+            this.send(packet).catch(e => {
               console.warn("MooVisuals: Failed to send queued packet:", e);
-            }
-          }
+            });
+          });
           this.packetQueue.length = 0;
         }
         return null;
@@ -364,7 +362,7 @@ class FakeWebsocket {
     if (CurrentSend !== OriginalFakeSend && typeof this.send === "function" && !this.sendMethodRerouted) {
       this.sendMethodRerouted = true;
       // call the new send with a flag to avoid infinite recursion
-      return this.send(raw, true);
+      return await this.send(raw, true);
     }
 
     if (!this.hasInit) {
