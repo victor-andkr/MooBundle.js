@@ -263,18 +263,16 @@ class FakeWebsocket {
     };
 
     this.realSocket.onmessage = (ev) => {
-      // translate server packets to mod-friendly format
-      const binary = this.translateMessage(ev.data);
-
-      if (!didntUseTurnstile) {
-        // Bug #1: If Turnstile WAS used, translate the message
+      // BUG #3: If Turnstile was NOT used, translate the message
+      if (didntUseTurnstile) {
+        const binary = this.translateMessage(ev.data);
         if (binary && this._onmessage) {
           this._onmessage.call(this, { ...ev, data: binary });
         }
         return;
       }
 
-      // If Turnstile was NOT used, forward original raw message
+      // If Turnstile WAS used, forward the message as-is (already handled by Turnstile)
       if (this._onmessage) this._onmessage.call(this, ev);
     };
 
@@ -305,11 +303,25 @@ class FakeWebsocket {
         const [id, seed, salt] = data;
         this.sequence = 0;
         this.tables = initTable(seed >>> 0);
-        this.key = hexToBytes(salt);
+        // BUG #9: Add try-catch for hexToBytes error handling
+        try {
+          this.key = hexToBytes(salt);
+        } catch (e) {
+          console.error("MooVisuals: Invalid salt from server:", e);
+          this.hasInit = false;
+          return null;
+        }
         this.hasInit = true;
 
         if (this.packetQueue.length) {
-          this.packetQueue.forEach(packet => this.send(packet));
+          // BUG #4: Use async/await for packet queue instead of forEach
+          for (const packet of this.packetQueue) {
+            try {
+              await this.send(packet);
+            } catch (e) {
+              console.warn("MooVisuals: Failed to send queued packet:", e);
+            }
+          }
           this.packetQueue.length = 0;
         }
         return null;
@@ -320,9 +332,9 @@ class FakeWebsocket {
         if (parsed[0] === undefined) return null;
       }
 
-      // Bug #6: Return the decoded array directly, not msgpack.encode()
-      // The client expects the decoded data, not msgpack bytes
-      return parsed;
+      // BUG #1: Return msgpack-encoded bytes so the game receives valid binary data
+      // The game expects msgpack bytes (Uint8Array), not a JavaScript Array
+      return msgpack.encode(parsed);
     } catch (e) {
       // If decode fails (including BUFFER_SHORTAGE), don't crash: return null so caller ignores packet
       console.warn("MooVisuals: Failed to decode message:", e);
@@ -390,17 +402,28 @@ class FakeWebsocket {
 
   async sendEncrypted(raw) {
     try {
+      // BUG #8: Check WebSocket state before sending
+      if (!this.realSocket || this.realSocket.readyState !== OriginalWebSocket.OPEN) {
+        console.warn("MooVisuals: WebSocket not ready, queuing packet");
+        this.packetQueue.push(raw);
+        return;
+      }
+
       // Try to decode with PACKET_PADDING (old format)
       let parsed;
+      let wasAlreadyEncrypted = false;
       try {
         parsed = msgpack.decode(raw.slice(PACKET_PADDING));
+        wasAlreadyEncrypted = true;
       } catch (e) {
         // Try without padding (new 2026 format)
         try {
           parsed = msgpack.decode(raw);
         } catch (e2) {
           // If both fail, send raw data
-          this.realSocket.send(raw);
+          if (this.realSocket?.readyState === OriginalWebSocket.OPEN) {
+            this.realSocket.send(raw);
+          }
           this.sequence++;
           return;
         }
@@ -408,28 +431,43 @@ class FakeWebsocket {
 
       if (!Array.isArray(parsed)) {
         this.sequence++;
-        this.realSocket.send(raw);
+        if (this.realSocket?.readyState === OriginalWebSocket.OPEN) {
+          this.realSocket.send(raw);
+        }
         return;
       }
 
+      // Update sequence number
       if (parsed.length < 3) {
         parsed[2] = this.sequence;
       } else {
         parsed[2] = this.sequence;
       }
 
-      const newRaw = msgpack.encode(parsed);
-      this.realSocket.send(newRaw);
+      // BUG #2: Re-encrypt with PACKET_PADDING + signature
+      const packetData = msgpack.encode(parsed);
+      const binary = new Uint8Array(PACKET_PADDING + packetData.length);
+
+      // Calculate and add HMAC signature
+      const signature = await getPacketSignature(this.key, packetData);
+      binary.set(signature, 0);  // First 6 bytes
+      binary.set(packetData, PACKET_PADDING);  // Data after padding
+
+      if (this.realSocket?.readyState === OriginalWebSocket.OPEN) {
+        this.realSocket.send(binary);
+      }
+      this.sequence++;
     } catch (e) {
-      console.warn("MooVisuals: Failed to encrypt packet:", e);
-      // Fallback to sending original raw data if encryption fails
-      try {
-        this.realSocket.send(raw);
-      } catch (fallbackError) {
-        console.warn("MooVisuals: Fallback send failed:", fallbackError);
+      console.warn("MooVisuals: Failed to send encrypted packet:", e);
+      this.sequence++;
+      if (this.realSocket?.readyState === OriginalWebSocket.OPEN) {
+        try {
+          this.realSocket.send(raw);
+        } catch (fallbackError) {
+          console.warn("MooVisuals: Fallback send failed:", fallbackError);
+        }
       }
     }
-    this.sequence++;
   }
 
   addEventListener(type, callback) {
